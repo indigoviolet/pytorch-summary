@@ -1,120 +1,122 @@
 import torch
-import torch.nn as nn
-from torch.autograd import Variable
-
-from collections import OrderedDict
 import numpy as np
 
+from tabulate import tabulate
+import attr
 
-def summary(model, input_size, batch_size=-1, device=torch.device('cuda:0'), dtypes=None):
-    result, params_info = summary_string(
-        model, input_size, batch_size, device, dtypes)
+from typing import List, Dict, Callable, Any, Iterable
+from functools import partial
+
+def get_tensor_sizes(inputs: Iterable[torch.Tensor]) -> List[torch.Size]:
+    return [i.size() for i in inputs]
+
+def summary(model: torch.nn.Module, *inputs: Any, batch_size: int=-1, get_input_sizes: Callable[[Iterable[Any]], List[torch.Size]] = get_tensor_sizes):
+    result, params_info = summary_string(model, *inputs, batch_size=batch_size, get_input_sizes=get_input_sizes)
     print(result)
 
     return params_info
 
+@attr.s
+class ModuleSummary:
+    key: str = attr.ib()
+    input_shape: List[int] = attr.ib(init=False)
+    output_shape: List[int] = attr.ib(init=False)
+    trainable: bool = attr.ib(init=False, default=False)
+    num_params: int = attr.ib(init=False, default=0)
 
-def summary_string(model, input_size, batch_size=-1, device=torch.device('cuda:0'), dtypes=None):
-    if dtypes == None:
-        dtypes = [torch.FloatTensor]*len(input_size)
+def register_hook(module, bs: int, module_summaries: Dict[str, ModuleSummary], reg_hooks: List) -> None:
+    def hook(module, input, output):
+        class_name = str(module.__class__).split(".")[-1].split("'")[0]
+        module_idx = len(module_summaries)
 
-    summary_str = ''
+        msum = ModuleSummary(f'{class_name}-{module_idx+1}')
+        msum.input_shape = [bs] + list(input[0].size())[1:]
+        msum.output_shape = [
+            [-1] + list(o.size())[1:] for o in output
+        ] if isinstance(output, (list, tuple)) else ([bs] + list(output.size())[1:])
 
-    def register_hook(module):
-        def hook(module, input, output):
-            class_name = str(module.__class__).split(".")[-1].split("'")[0]
-            module_idx = len(summary)
+        if hasattr(module, "weight") and hasattr(module.weight, "size"):
+            msum.num_params += np.prod(module.weight.size())
+            msum.trainable = module.weight.requires_grad
+        if hasattr(module, "bias") and hasattr(module.bias, "size"):
+            msum.num_params += np.prod(module.bias.size())
 
-            m_key = "%s-%i" % (class_name, module_idx + 1)
-            summary[m_key] = OrderedDict()
-            summary[m_key]["input_shape"] = list(input[0].size())
-            summary[m_key]["input_shape"][0] = batch_size
-            if isinstance(output, (list, tuple)):
-                summary[m_key]["output_shape"] = [
-                    [-1] + list(o.size())[1:] for o in output
-                ]
-            else:
-                summary[m_key]["output_shape"] = list(output.size())
-                summary[m_key]["output_shape"][0] = batch_size
+        module_summaries[msum.key] = msum
 
-            params = 0
-            if hasattr(module, "weight") and hasattr(module.weight, "size"):
-                params += torch.prod(torch.LongTensor(list(module.weight.size())))
-                summary[m_key]["trainable"] = module.weight.requires_grad
-            if hasattr(module, "bias") and hasattr(module.bias, "size"):
-                params += torch.prod(torch.LongTensor(list(module.bias.size())))
-            summary[m_key]["nb_params"] = params
+    if (
+        not isinstance(module, torch.nn.Sequential)
+        and not isinstance(module, torch.nn.ModuleList)
+    ):
+        reg_hooks.append(module.register_forward_hook(hook))
 
-        if (
-            not isinstance(module, nn.Sequential)
-            and not isinstance(module, nn.ModuleList)
-        ):
-            hooks.append(module.register_forward_hook(hook))
+def make_random_input(*shape: int, dtype=torch.FloatTensor, device=torch.device('cuda:0'), bs: int = 2):
+    return torch.rand(bs, *shape).type(dtype).to(device=device)
 
-    # multiple inputs to the network
-    if isinstance(input_size, tuple):
-        input_size = [input_size]
 
-    # batch_size of 2 for batchnorm
-    x = [torch.rand(2, *in_size).type(dtype).to(device=device)
-         for in_size, dtype in zip(input_size, dtypes)]
+def summary_string(model: torch.nn.Module, *inputs: Any, batch_size: int=-1, get_input_sizes: Callable[[Iterable[Any]], List[torch.Size]] = get_tensor_sizes):
+    # if dtypes == None:
+    #     dtypes = [torch.FloatTensor]*len(input_size)
+
+    # # multiple inputs to the network
+    # if isinstance(input_size, tuple):
+    #     input_size = [input_size]
+
+    # # batch_size of 2 for batchnorm
+    # x = [make_random_input(*in_size, dtype=dtype, device=device, bs=2) for in_size, dtype in zip(input_size, dtypes)]
+
+    input_sizes = get_input_sizes(inputs)
+    assert len(input_sizes) == len(inputs), f"Input sizes from get_input_sizes must match the number of inputs: {len(inputs)=} {len(input_sizes)=}"
+    assert all(sz[0] >= 2 for sz in input_sizes), "Each input must have batch_size >= 2 (for batchnorm)"
 
     # create properties
-    summary = OrderedDict()
-    hooks = []
+    summ: Dict[str, ModuleSummary] = {}
+    hooks: List = []
 
     # register hook
-    model.apply(register_hook)
+    model.apply(partial(register_hook, reg_hooks=hooks, module_summaries=summ, bs=batch_size))
 
     # make a forward pass
     # print(x.shape)
-    model(*x)
+    model(*inputs)
 
     # remove these hooks
     for h in hooks:
         h.remove()
 
-    summary_str += "----------------------------------------------------------------" + "\n"
-    line_new = "{:>20}  {:>25} {:>15}".format(
-        "Layer (type)", "Output Shape", "Param #")
-    summary_str += line_new + "\n"
-    summary_str += "================================================================" + "\n"
     total_params = 0
     total_output = 0
     trainable_params = 0
-    for layer in summary:
-        # input_shape, output_shape, trainable, nb_params
-        line_new = "{:>20}  {:>25} {:>15}".format(
-            layer,
-            str(summary[layer]["output_shape"]),
-            "{0:,}".format(summary[layer]["nb_params"]),
-        )
-        total_params += summary[layer]["nb_params"]
+    layer_table = []
+    for layer, msum in summ.items():
+        layer_table.append([layer, msum.output_shape, msum.num_params])
+        total_params += msum.num_params
 
-        total_output += np.prod(summary[layer]["output_shape"])
-        if "trainable" in summary[layer]:
-            if summary[layer]["trainable"] == True:
-                trainable_params += summary[layer]["nb_params"]
-        summary_str += line_new + "\n"
+        total_output += np.prod(msum.output_shape)
+        if msum.trainable:
+            trainable_params += msum.num_params
 
     # assume 4 bytes/number (float on cuda).
-    total_input_size = abs(np.prod(sum(input_size, ()))
-                           * batch_size * 4. / (1024 ** 2.))
-    total_output_size = abs(2. * total_output * 4. /
-                            (1024 ** 2.))  # x2 for gradients
-    total_params_size = abs(total_params * 4. / (1024 ** 2.))
+    bytes_per_mb = 1024 ** 2
+    bytes_per_num = 4
+    total_input_size = abs(np.prod(sum(input_sizes, ())) * batch_size * bytes_per_num / bytes_per_mb)
+    total_output_size = abs(2. * total_output * bytes_per_num / bytes_per_mb)  # x2 for gradients
+    total_params_size = abs(total_params * bytes_per_num / bytes_per_mb)
     total_size = total_params_size + total_output_size + total_input_size
 
-    summary_str += "================================================================" + "\n"
-    summary_str += "Total params: {0:,}".format(total_params) + "\n"
-    summary_str += "Trainable params: {0:,}".format(trainable_params) + "\n"
-    summary_str += "Non-trainable params: {0:,}".format(total_params -
-                                                        trainable_params) + "\n"
-    summary_str += "----------------------------------------------------------------" + "\n"
-    summary_str += "Input size (MB): %0.2f" % total_input_size + "\n"
-    summary_str += "Forward/backward pass size (MB): %0.2f" % total_output_size + "\n"
-    summary_str += "Params size (MB): %0.2f" % total_params_size + "\n"
-    summary_str += "Estimated Total Size (MB): %0.2f" % total_size + "\n"
-    summary_str += "----------------------------------------------------------------" + "\n"
-    # return summary
+    summary_table = [
+        ["Total params", total_params],
+        ["Trainable params", trainable_params],
+        ["Non-trainable params", total_params - trainable_params],
+        ["Input size (MB)", total_input_size],
+        ["Forward/backward pass size (MB)", total_output_size],
+        ["Params size (MB)", total_params_size],
+        ["Estimated Total Size (MB)", total_size]
+    ]
+
+    summary_str = "\n".join([
+        tabulate(layer_table, headers=["Layer (type)", "Output Shape", "Param #"]),
+        tabulate(summary_table)
+    ])
+
+    # return summ
     return summary_str, (total_params, trainable_params)
