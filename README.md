@@ -1,11 +1,20 @@
-## Keras style `model.summary()` in PyTorch
+## PyTorch model summaries
+
+This is based on https://github.com/sksq96/pytorch-summary, but
+modernizes and simplifies some of the code, and adds one important
+feature: it supports arbitrary inputs instead of just torch Tensors.
+
+
+
+
+
 [![PyPI version](https://badge.fury.io/py/torchsummary.svg)](https://badge.fury.io/py/torchsummary)
 
 Keras has a neat API to view the visualization of the model which is very helpful while debugging your network. Here is a barebone code to try and mimic the same in PyTorch. The aim is to provide information complementary to, what is not provided by `print(your_model)` in PyTorch.
 
 ### Usage
 
-- `pip install torchsummary` or 
+- `pip install torchsummary` or
 - `git clone https://github.com/sksq96/pytorch-summary`
 
 ```python
@@ -163,7 +172,7 @@ class SimpleConv(nn.Module):
         x1 = self.features(x)
         x2 = self.features(y)
         return x1, x2
-    
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model = SimpleConv().to(device)
 
@@ -196,5 +205,5 @@ Estimated Total Size (MB): 0.78
 ### References
 
 - The idea for this package sparked from [this PyTorch issue](https://github.com/pytorch/pytorch/issues/2001).
-- Thanks to @ncullen93 and @HTLife. 
+- Thanks to @ncullen93 and @HTLife.
 - For Model Size Estimation @jacobkimmel ([details here](https://github.com/sksq96/pytorch-summary/pull/21))
