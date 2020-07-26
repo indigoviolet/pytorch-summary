@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+
 class SingleInputNet(nn.Module):
     def __init__(self):
         super(SingleInputNet, self).__init__()
@@ -19,6 +20,7 @@ class SingleInputNet(nn.Module):
         x = self.fc2(x)
         return F.log_softmax(x, dim=1)
 
+
 class MultipleInputNet(nn.Module):
     def __init__(self):
         super(MultipleInputNet, self).__init__()
@@ -35,6 +37,7 @@ class MultipleInputNet(nn.Module):
         x2 = self.fc2b(x2)
         x = torch.cat((x1, x2), 0)
         return F.log_softmax(x, dim=1)
+
 
 class MultipleInputNetDifferentDtypes(nn.Module):
     def __init__(self):

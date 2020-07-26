@@ -1,16 +1,17 @@
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-from torchsummary import summary, summary_string, make_random_input
-from example_models import SingleInputNet, MultipleInputNet, MultipleInputNetDifferentDtypes
+from ..torchsummary import summary, summary_string, make_random_input
+from .example_models import (
+    SingleInputNet,
+    MultipleInputNet,
+    MultipleInputNetDifferentDtypes,
+)
 import torch
 
 gpu_if_available = "cuda:0" if torch.cuda.is_available() else "cpu"
 
+
 def assertEqual(a, b):
     assert a == b
+
 
 class TestSummary:
     def test_single_input(self):
