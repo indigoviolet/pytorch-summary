@@ -59,7 +59,6 @@ class TestSummaryString:
         model = SingleInputNet()
         input = make_random_input(1, 28, 28, device="cpu")
         result, (total_params, trainable_params) = summary_string(model, input)
-        print(result)
         assertEqual(type(result), str)
         assertEqual(total_params, 21840)
         assertEqual(trainable_params, 21840)
