@@ -19,10 +19,10 @@ setup(
     python_requires='==3.*,>=3.8.0',
     author='Venky Iyer',
     author_email='indigoviolet@gmail.com',
-    packages=['torchsummary', 'torchsummary.tests'],
+    packages=['pytorch_summary', 'pytorch_summary.tests'],
     package_dir={"": "."},
     package_data={
-        "torchsummary": [
+        "pytorch_summary": [
             ".mypy_cache/3.8/*.json", ".mypy_cache/3.8/attr/*.json",
             ".mypy_cache/3.8/collections/*.json",
             ".mypy_cache/3.8/ctypes/*.json", ".mypy_cache/3.8/email/*.json",
@@ -65,7 +65,7 @@ setup(
             ".mypy_cache/3.8/torchsummary/*.json",
             ".mypy_cache/3.8/urllib/*.json"
         ],
-        "torchsummary.tests": [
+        "pytorch_summary.tests": [
             ".mypy_cache/3.8/*.json", ".mypy_cache/3.8/attr/*.json",
             ".mypy_cache/3.8/collections/*.json",
             ".mypy_cache/3.8/ctypes/*.json", ".mypy_cache/3.8/email/*.json",
