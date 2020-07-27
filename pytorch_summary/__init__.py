@@ -1,1 +1,1 @@
-from torchsummary import summary, make_random_input
+from .torchsummary import summary, make_random_input, shape

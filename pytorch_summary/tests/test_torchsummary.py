@@ -1,12 +1,10 @@
-from ..torchsummary import summary, summary_string, make_random_input
+from ..torchsummary import summary, summary_string, make_random_input, gpu_if_available
 from .example_models import (
     SingleInputNet,
     MultipleInputNet,
     MultipleInputNetDifferentDtypes,
 )
 import torch
-
-gpu_if_available = "cuda:0" if torch.cuda.is_available() else "cpu"
 
 
 def assertEqual(a, b):
