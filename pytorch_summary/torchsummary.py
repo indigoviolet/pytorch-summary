@@ -17,9 +17,14 @@ def get_tensor_size(input: torch.Tensor, idx: int) -> torch.Size:
 
 
 def make_random_input(
-    *shape: int, dtype=torch.FloatTensor, device=gpu_if_available, bs: int = 2
+    *shape: int, dtype=torch.FloatTensor, device=gpu_if_available, bs: Optional[int] = 2
 ):
-    return torch.rand(bs, *shape).type(dtype).to(device=device)
+    """
+    Chooses bs=2 by default for batchnorm. bs=None means to squeeze out that dimensino
+    """
+    assert len(shape) == 3, "Expected shape to be (C, H, W), got {shape=}"
+    shape = (bs, *shape) if bs is not None else shape
+    return torch.rand(*shape).type(dtype).to(device=device)
 
 
 @attr.s(auto_attribs=True)
@@ -46,10 +51,12 @@ class Shape:
             return t(self._dump(v, maxlen) for v in arg)
         elif t is list and maxlen <= len(arg):
             return (f"L({len(arg)})", [self._dump(v, maxlen) for v in arg[:maxlen]])
-        elif hasattr(arg, "shape"):
-            return self._dump(arg.shape, maxlen)
         elif t is torch.Size:
             return self._get_torch_size_as_list(arg)
+        elif hasattr(arg, "shape"):
+            s = arg.shape
+            # Handle tensors of one item
+            return self._dump(s, maxlen) if len(s) else arg
         elif arg.__class__.__module__ == "builtins":
             return arg
         else:
@@ -58,24 +65,6 @@ class Shape:
 
 def classname(arg) -> str:
     return f"{arg.__class__.__module__}.{arg.__class__.__qualname__}"
-
-
-def summary(
-    model: torch.nn.Module,
-    *inputs: Any,
-    batch_size: int = -1,
-    get_input_size: Callable[[Any, int], torch.Size] = get_tensor_size,
-    include_input_shape: bool = False,
-) -> Tuple[int, int]:
-    result, total_params, trainable_params = summary_string(
-        model,
-        *inputs,
-        batch_size=batch_size,
-        get_input_size=get_input_size,
-        include_input_shape=include_input_shape,
-    )
-    print(result)
-    return (total_params, trainable_params)
 
 
 def shape(arg, maxlen=3) -> Shape:
@@ -125,13 +114,14 @@ def register_hooks(model, summaries: Dict[str, ModuleSummary], bs: int) -> List:
     return hooks
 
 
-def summary_string(
+def summary(
     model: torch.nn.Module,
     *inputs: Any,
     batch_size: int = -1,
     get_input_size: Callable[[Any, int], torch.Size] = get_tensor_size,
     include_input_shape: bool = False,
-) -> Tuple[str, int, int]:
+    eval: bool = True,
+) -> Tuple[int, int]:
 
     input_sizes: List[List[int]] = [
         list(get_input_size(inp, i)) for i, inp in enumerate(inputs)
@@ -149,22 +139,23 @@ def summary_string(
     restore_training = model.training
     try:
         register_hooks(model, summaries=module_summaries, bs=batch_size)
-        # make a forward pass
-        model.eval()
+        if eval:
+            model.eval()
         with torch.no_grad():
             model(*inputs)
     finally:
-        # Undo
         model.train(restore_training)
         for h in hooks:
             h.remove()
 
-    return make_output(
+    summary_table, total_params, trainable_params = make_output(
         summaries=module_summaries,
         batch_size=batch_size,
         input_sizes=input_sizes,
         include_input_shape=include_input_shape,
     )
+    print(summary_table)
+    return total_params, trainable_params
 
 
 def make_output(
