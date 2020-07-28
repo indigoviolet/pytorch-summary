@@ -5,7 +5,6 @@ from tabulate import tabulate
 import attr
 
 from typing import List, Dict, Callable, Any, Iterable, Optional, Union, Tuple
-from functools import partial, cached_property
 from pprint import pformat
 
 
@@ -84,10 +83,10 @@ def shape(arg, maxlen=3) -> Shape:
 
 @attr.s
 class ModuleSummary:
-    key: str = attr.ib()
-    idx: int = attr.ib()
-    input_shape: Shape = attr.ib(init=False)
-    output_shape: Shape = attr.ib(init=False)
+    name: str = attr.ib()
+    sort_key: int = attr.ib()
+    input_shape: Shape = attr.ib()
+    output_shape: Shape = attr.ib()
     trainable: bool = attr.ib(init=False, default=False)
     num_params: int = attr.ib(init=False, default=0)
 
@@ -96,10 +95,13 @@ def get_hook(
     module, idx: int, name: str, summaries: Dict[str, ModuleSummary], bs: int
 ) -> Callable:
     def hook(module, input, output):
-        msum = ModuleSummary(f"{name or '?'} ({module.__class__.__name__})", idx)
         # Input is a tuple of size 1, always?
-        msum.input_shape = shape(*input)
-        msum.output_shape = shape(output)
+        msum = ModuleSummary(
+            name=f"{name or '?'} ({module.__class__.__name__})",
+            sort_key=idx,
+            input_shape=shape(*input),
+            output_shape=shape(output),
+        )
 
         if hasattr(module, "weight") and hasattr(module.weight, "size"):
             msum.num_params += np.prod(module.weight.size())
@@ -107,7 +109,7 @@ def get_hook(
         if hasattr(module, "bias") and hasattr(module.bias, "size"):
             msum.num_params += np.prod(module.bias.size())
 
-        summaries[msum.key] = msum
+        summaries[msum.name] = msum
 
     return hook
 
@@ -174,18 +176,22 @@ def make_output(
     total_output_approx = False
     trainable_params = 0
     layer_table = []
-    for m in sorted(summaries.values(), key=lambda m: m.idx):
+    for m in sorted(summaries.values(), key=lambda m: m.sort_key):
         row = [
-            m.key,
-            (
-                pformat(m.input_shape.dump(), width=SHAPE_COL_WIDTH)
-                if include_input_shape
-                else None
-            ),
-            pformat(m.output_shape.dump(), width=SHAPE_COL_WIDTH),
-            m.num_params,
+            c
+            for c in [
+                m.name,
+                (
+                    pformat(m.input_shape.dump(), width=SHAPE_COL_WIDTH)
+                    if include_input_shape
+                    else None
+                ),
+                pformat(m.output_shape.dump(), width=SHAPE_COL_WIDTH),
+                m.num_params,
+            ]
+            if c is not None
         ]
-        layer_table.append([c for c in row if c is not None])
+        layer_table.append(row)
 
         total_params += m.num_params
         if (output_size := m.output_shape.size) is not None:
