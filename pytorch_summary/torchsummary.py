@@ -66,8 +66,8 @@ def summary(
     batch_size: int = -1,
     get_input_size: Callable[[Any, int], torch.Size] = get_tensor_size,
     include_input_shape: bool = False,
-):
-    result = summary_string(
+) -> Tuple[int, int]:
+    result, total_params, trainable_params = summary_string(
         model,
         *inputs,
         batch_size=batch_size,
@@ -75,6 +75,7 @@ def summary(
         include_input_shape=include_input_shape,
     )
     print(result)
+    return (total_params, trainable_params)
 
 
 def shape(arg, maxlen=3) -> Shape:
@@ -130,9 +131,11 @@ def summary_string(
     batch_size: int = -1,
     get_input_size: Callable[[Any, int], torch.Size] = get_tensor_size,
     include_input_shape: bool = False,
-) -> str:
+) -> Tuple[str, int, int]:
 
-    input_sizes = [get_input_size(inp, i) for i, inp in enumerate(inputs)]
+    input_sizes: List[List[int]] = [
+        list(get_input_size(inp, i)) for i, inp in enumerate(inputs)
+    ]
     assert len(input_sizes) == len(
         inputs
     ), f"Input sizes from get_input_sizes must match the number of inputs: {len(inputs)=} {len(input_sizes)=}"
@@ -169,7 +172,7 @@ def make_output(
     batch_size: int,
     input_sizes: List[torch.Size],
     include_input_shape: bool = False,
-) -> str:
+) -> Tuple[str, int, int]:
 
     total_params = 0
     total_output = 0
@@ -244,4 +247,4 @@ def make_output(
         ]
     )
 
-    return summary_str
+    return summary_str, total_params, trainable_params
