@@ -17,6 +17,12 @@ def get_tensor_size(input: torch.Tensor, idx: int) -> torch.Size:
     return input.size()
 
 
+def make_random_input(
+    *shape: int, dtype=torch.FloatTensor, device=gpu_if_available, bs: int = 2
+):
+    return torch.rand(bs, *shape).type(dtype).to(device=device)
+
+
 @attr.s(auto_attribs=True)
 class Shape:
     value: Any
@@ -104,12 +110,6 @@ def get_hook(
         summaries[msum.key] = msum
 
     return hook
-
-
-def make_random_input(
-    *shape: int, dtype=torch.FloatTensor, device=gpu_if_available, bs: int = 2
-):
-    return torch.rand(bs, *shape).type(dtype).to(device=device)
 
 
 def register_hooks(model, summaries: Dict[str, ModuleSummary], bs: int) -> List:
