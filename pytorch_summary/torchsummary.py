@@ -4,12 +4,13 @@ import numpy as np
 from tabulate import tabulate
 import attr
 
-from typing import List, Dict, Callable, Any, Iterable, Optional, Union
+from typing import List, Dict, Callable, Any, Iterable, Optional, Union, Tuple
 from functools import partial, cached_property
 from pprint import pformat
 
 
 gpu_if_available = "cuda:0" if torch.cuda.is_available() else "cpu"
+SHAPE_COL_WIDTH = 50
 
 
 def get_tensor_size(input: torch.Tensor, idx: int) -> torch.Size:
@@ -59,39 +60,37 @@ def summary(
     *inputs: Any,
     batch_size: int = -1,
     get_input_size: Callable[[Any, int], torch.Size] = get_tensor_size,
+    include_input_shape: bool = False,
 ):
-    result, params_info = summary_string(
-        model, *inputs, batch_size=batch_size, get_input_size=get_input_size
+    result = summary_string(
+        model,
+        *inputs,
+        batch_size=batch_size,
+        get_input_size=get_input_size,
+        include_input_shape=include_input_shape,
     )
     print(result)
-
-    return params_info
 
 
 def shape(arg, maxlen=3) -> Shape:
     return Shape(arg, maxlen=maxlen)
 
 
-SHAPE_COL_WIDTH = 50
-
-
 @attr.s
 class ModuleSummary:
     key: str = attr.ib()
+    idx: int = attr.ib()
     input_shape: Shape = attr.ib(init=False)
     output_shape: Shape = attr.ib(init=False)
     trainable: bool = attr.ib(init=False, default=False)
     num_params: int = attr.ib(init=False, default=0)
 
 
-def register_hook(
-    module, bs: int, summaries: Dict[str, ModuleSummary], reg_hooks: List
-) -> None:
+def get_hook(
+    module, idx: int, name: str, summaries: Dict[str, ModuleSummary], bs: int
+) -> Callable:
     def hook(module, input, output):
-        class_name = str(module.__class__).split(".")[-1].split("'")[0]
-        module_idx = len(summaries)
-
-        msum = ModuleSummary(f"{class_name}-{module_idx+1}")
+        msum = ModuleSummary(f"{name or '?'} ({module.__class__.__name__})", idx)
         # Input is a tuple of size 1, always?
         msum.input_shape = shape(*input)
         msum.output_shape = shape(output)
@@ -104,10 +103,7 @@ def register_hook(
 
         summaries[msum.key] = msum
 
-    if not isinstance(module, torch.nn.Sequential) and not isinstance(
-        module, torch.nn.ModuleList
-    ):
-        reg_hooks.append(module.register_forward_hook(hook))
+    return hook
 
 
 def make_random_input(
@@ -116,12 +112,24 @@ def make_random_input(
     return torch.rand(bs, *shape).type(dtype).to(device=device)
 
 
+def register_hooks(model, summaries: Dict[str, ModuleSummary], bs: int) -> List:
+    hooks = []
+    for idx, (module_name, module) in enumerate(model.named_modules()):
+        if isinstance(module, (torch.nn.Sequential, torch.nn.ModuleList)):
+            continue
+        hk = get_hook(module, name=module_name, idx=idx, summaries=summaries, bs=bs)
+        hooks.append(module.register_forward_hook(hk))
+    return hooks
+
+
 def summary_string(
     model: torch.nn.Module,
     *inputs: Any,
     batch_size: int = -1,
     get_input_size: Callable[[Any, int], torch.Size] = get_tensor_size,
-):
+    include_input_shape: bool = False,
+) -> str:
+
     input_sizes = [get_input_size(inp, i) for i, inp in enumerate(inputs)]
     assert len(input_sizes) == len(
         inputs
@@ -135,16 +143,7 @@ def summary_string(
 
     restore_training = model.training
     try:
-        # register hook
-        model.apply(
-            partial(
-                register_hook,
-                reg_hooks=hooks,
-                summaries=module_summaries,
-                bs=batch_size,
-            )
-        )
-
+        register_hooks(model, summaries=module_summaries, bs=batch_size)
         # make a forward pass
         model.eval()
         with torch.no_grad():
@@ -155,26 +154,46 @@ def summary_string(
         for h in hooks:
             h.remove()
 
+    return make_output(
+        summaries=module_summaries,
+        batch_size=batch_size,
+        input_sizes=input_sizes,
+        include_input_shape=include_input_shape,
+    )
+
+
+def make_output(
+    summaries: Dict[str, ModuleSummary],
+    batch_size: int,
+    input_sizes: List[torch.Size],
+    include_input_shape: bool = False,
+) -> str:
+
     total_params = 0
     total_output = 0
     total_output_approx = False
     trainable_params = 0
     layer_table = []
-    for layer, msum in module_summaries.items():
-        layer_table.append(
-            [
-                layer,
-                pformat(msum.output_shape.dump(), width=SHAPE_COL_WIDTH),
-                msum.num_params,
-            ]
-        )
-        total_params += msum.num_params
-        if (output_size := msum.output_shape.size) is not None:
+    for m in sorted(summaries.values(), key=lambda m: m.idx):
+        row = [
+            m.key,
+            (
+                pformat(m.input_shape.dump(), width=SHAPE_COL_WIDTH)
+                if include_input_shape
+                else None
+            ),
+            pformat(m.output_shape.dump(), width=SHAPE_COL_WIDTH),
+            m.num_params,
+        ]
+        layer_table.append([c for c in row if c is not None])
+
+        total_params += m.num_params
+        if (output_size := m.output_shape.size) is not None:
             total_output += output_size
         else:
             total_output_approx = True
-        if msum.trainable:
-            trainable_params += msum.num_params
+        if m.trainable:
+            trainable_params += m.num_params
 
     # assume 4 bytes/number (float on cuda).
     bytes_per_mb = 1024 ** 2
@@ -201,17 +220,22 @@ def summary_string(
         ],
     ]
 
+    headers = [
+        h
+        for h in [
+            "Layer (type)",
+            "Input Shape" if include_input_shape else None,
+            "Output Shape",
+            "Num params",
+        ]
+        if h is not None
+    ]
     summary_str = "\n".join(
         [
-            tabulate(
-                layer_table,
-                headers=["Layer (type)", "Output Shape", "Param #"],
-                floatfmt=",.0f",
-                tablefmt="psql",
-            ),
+            tabulate(layer_table, headers=headers, floatfmt=",.0f", tablefmt="psql",),
             "",
             tabulate(summary_table, floatfmt=",.1f", tablefmt="psql"),
         ]
     )
 
-    return summary_str, (total_params, trainable_params)
+    return summary_str
