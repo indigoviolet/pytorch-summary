@@ -71,6 +71,7 @@ class Shape:
             s = arg.shape
             if len(s):
                 sz_lst = self._get_torch_size_as_list(s)
+                # key by id() so that we can later uniquify
                 self._tensors[id(arg)] = (sz_lst, self._get_tensor_size(sz_lst))
                 return sz_lst
             else:
@@ -227,7 +228,11 @@ def make_output(
         ]
         if h is not None
     ]
-    intermediates = {}
+
+    # We use a dict to uniquify tensors among the intermediate
+    # (ie. all inputs + last output) feature maps : the key is
+    # id(tensor)
+    intermediates: Dict[int, int] = {}
     for m in sorted(summaries.values(), key=lambda m: m.input_order):
         assert m.output_shape is not None
         row = [
