@@ -1,18 +1,19 @@
-import torch
-import numpy as np
-
-from tabulate import tabulate
-import attr
-
-from typing import List, Dict, Callable, Any, Iterable, Optional, Union, Tuple
+from collections import defaultdict
 from pprint import pformat
+from typing import (Any, Callable, Dict, Generator, Iterable, List, Optional,
+                    Tuple, Union)
 
-
-from humanfriendly import format_size, format_number
-
+import attr
+import numpy as np
+import tabulate
+import torch
+from humanfriendly import format_number, format_size
 
 gpu_if_available = "cuda:0" if torch.cuda.is_available() else "cpu"
 SHAPE_COL_WIDTH = 50
+
+
+tabulate.PRESERVE_WHITESPACE = True
 
 
 def get_tensor_size(input: torch.Tensor, idx: int) -> torch.Size:
@@ -91,9 +92,10 @@ def shape(arg, maxlen=3) -> Shape:
     return Shape(arg, maxlen=maxlen)
 
 
-@attr.s
+@attr.s(eq=False)
 class ModuleSummary:
     name: str = attr.ib()
+    module_class: str = attr.ib()
     input_order: int = attr.ib()
     input_shape: Shape = attr.ib()
     output_order: int = attr.ib(default=-1)
@@ -108,7 +110,8 @@ def get_pre_hook(module, name: str, summaries: Dict[str, ModuleSummary]) -> Call
             return
 
         msum = ModuleSummary(
-            name=f"{name or '?'} ({module.__class__.__name__})",
+            name=name,
+            module_class=module.__class__.__name__,
             input_order=len(summaries),
             # Input is a tuple of size 1, always?
             input_shape=shape(*input),
@@ -233,12 +236,15 @@ def make_output(
     # (ie. all inputs + last output) feature maps : the key is
     # id(tensor)
     intermediates: Dict[int, int] = {}
-    for m in sorted(summaries.values(), key=lambda m: m.input_order):
+    labeled_summaries = create_tree_labels(
+        sorted(summaries.values(), key=lambda m: m.input_order)
+    )
+    for m, label in labeled_summaries:
         assert m.output_shape is not None
         row = [
             c
             for c in [
-                m.name,
+                label,
                 (
                     pformat(m.input_shape.dump(), width=SHAPE_COL_WIDTH)
                     if include_input_shape
@@ -284,15 +290,73 @@ def make_output(
 
     summary_str = "\n".join(
         [
-            tabulate(
+            tabulate.tabulate(
                 layer_table,
                 headers=layer_table_header,
                 floatfmt=",.0f",
                 tablefmt="psql",
             ),
             "",
-            tabulate(summary_table, floatfmt=",.1f", tablefmt="psql"),
+            tabulate.tabulate(summary_table, floatfmt=",.1f", tablefmt="psql"),
         ]
     )
 
     return summary_str, total_params, trainable_params
+
+
+def parse_tree(
+    summaries: Iterable[ModuleSummary],
+) -> Dict[ModuleSummary, Tuple[List[str], Optional[str], str]]:
+    # not all nodes in the tree have summaries. this function computes
+    # the ancestors for each module that do have summaries, and the
+    # "leaf name" which is the path from the nearest ancestor.
+
+    nodes = set(s.name for s in summaries)
+
+    tree: Dict[ModuleSummary, Tuple[List[str], Optional[str], str]] = {}
+    for s in summaries:
+        if s.name == "":
+            tree[s] = ([], None, "")
+        else:
+            parts = s.name.split(".")
+            ancestors = []
+            last_ancestor_i = 0
+            for i in range(len(parts)):
+                path = ".".join(parts[:i])
+                if path in nodes:
+                    ancestors.append(path)
+                    last_ancestor_i = i
+            leaf = ".".join(parts[last_ancestor_i:])
+            tree[s] = (ancestors, ancestors[-1], leaf)
+    return tree
+
+
+def create_tree_labels(
+    summaries: Iterable[ModuleSummary],
+) -> Generator[Tuple[ModuleSummary, str], None, None]:
+
+    vert_stem, branch, end_branch, space = (
+        "\u2502 ",  # │
+        "\u251c\u2500\u2500 ",  # ├──
+        "\u2514\u2500\u2500 ",  # └──
+        " ",
+    )
+
+    tree = parse_tree(summaries)
+
+    num_children: Dict[Optional[str], int] = defaultdict(lambda: 0)
+    for s in summaries:
+        parent = tree[s][1]
+        num_children[parent] += 1
+
+    for s in summaries:
+        ancestors, parent, leaf = tree[s]
+        if not len(ancestors):
+            yield (s, s.module_class)
+        else:
+            child_counts = [num_children[a] for a in ancestors]
+            stems = "".join(vert_stem if c > 0 else " " for c in child_counts[:-1])
+            br = end_branch if child_counts[-1] == 1 else branch
+            yield (s, f"{stems}{br}{leaf} ({s.module_class})")
+
+        num_children[parent] -= 1
