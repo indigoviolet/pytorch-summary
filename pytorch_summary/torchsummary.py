@@ -1,13 +1,23 @@
 from collections import defaultdict
 from pprint import pformat
-from typing import (Any, Callable, Dict, Generator, Iterable, List, Optional,
-                    Tuple, Union)
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Generator,
+    Iterable,
+    List,
+    Optional,
+    Tuple,
+    Union,
+)
 
 import attr
 import numpy as np
 import tabulate
 import torch
 from humanfriendly import format_number, format_size
+from shapely import shape, Shape
 
 gpu_if_available = "cuda:0" if torch.cuda.is_available() else "cpu"
 SHAPE_COL_WIDTH = 50
@@ -31,67 +41,6 @@ def make_random_input(
     return torch.rand(*shape).type(dtype).to(device=device)
 
 
-@attr.s(auto_attribs=True, eq=False)
-class Shape:
-    value: Any = attr.ib(repr=False)
-    maxlen: int = 3
-    _tensors: Dict[int, Tuple[List[int], int]] = attr.ib(factory=dict, init=False)
-    _parsed: Any = attr.ib(init=False)
-
-    def __attrs_post_init__(self):
-        self._parsed = self._parse(self.value, maxlen=self.maxlen)
-
-    def _get_torch_size_as_list(self, arg) -> List[int]:
-        return [-1] + list(arg[1:]) if len(arg) > 3 else list(arg)
-
-    def _get_tensor_size(self, sp: List[int]) -> int:
-        return abs(np.prod(sp))
-
-    @property
-    def size(self) -> int:
-        return sum(sz for _, sz in self._tensors.values())
-
-    @property
-    def tensor_sizes(self) -> Dict[int, int]:
-        return {k: sz for k, (_, sz) in self._tensors.items()}
-
-    def dump(self):
-        return self._parsed
-
-    def _parse(self, arg, maxlen) -> Any:
-        t = type(arg)
-        if t is dict:
-            return {k: self._parse(v, maxlen) for k, v in arg.items()}
-        elif t is tuple or (t is list and maxlen >= len(arg)):
-            return t(self._parse(v, maxlen) for v in arg)
-        elif t is list and maxlen <= len(arg):
-            return (f"L({len(arg)})", [self._parse(v, maxlen) for v in arg[:maxlen]])
-        elif hasattr(arg, "shape"):
-            # Note: if maxlen limits how deep we recurse into `value`,
-            # we will not capture all tensors
-            s = arg.shape
-            if len(s):
-                sz_lst = self._get_torch_size_as_list(s)
-                # key by id() so that we can later uniquify
-                self._tensors[id(arg)] = (sz_lst, self._get_tensor_size(sz_lst))
-                return sz_lst
-            else:
-                # tensor of one item
-                return arg
-        elif arg.__class__.__module__ == "builtins":
-            return arg
-        else:
-            return classname(arg)
-
-
-def classname(arg) -> str:
-    return f"{arg.__class__.__module__}.{arg.__class__.__qualname__}"
-
-
-def shape(arg, maxlen=3) -> Shape:
-    return Shape(arg, maxlen=maxlen)
-
-
 @attr.s(eq=False)
 class ModuleSummary:
     name: str = attr.ib()
@@ -102,6 +51,7 @@ class ModuleSummary:
     output_shape: Optional[Shape] = attr.ib(default=None)
     trainable: bool = attr.ib(default=False)
     num_params: int = attr.ib(default=0)
+    kernel_size: Optional[Tuple[int, int]] = attr.ib(default=None)
 
 
 def get_pre_hook(module, name: str, summaries: Dict[str, ModuleSummary]) -> Callable:
@@ -122,6 +72,9 @@ def get_pre_hook(module, name: str, summaries: Dict[str, ModuleSummary]) -> Call
             msum.trainable = module.weight.requires_grad
         if hasattr(module, "bias") and hasattr(module.bias, "size"):
             msum.num_params += np.prod(module.bias.size())
+
+        if isinstance(module, torch.nn.Conv2d):
+            msum.kernel_size = module.kernel_size
 
         summaries[name] = msum
 
@@ -228,6 +181,7 @@ def make_output(
             "Output Shape",
             "Input size",
             "Num params",
+            "Conv2d complexity (C_i * C_o * H_o * W_o))",
         ]
         if h is not None
     ]
@@ -241,6 +195,17 @@ def make_output(
     )
     for m, label in labeled_summaries:
         assert m.output_shape is not None
+
+        conv2d_complexity = (
+            (
+                m.input_shape.tensor_shape[1]  # num_input_filters
+                * m.output_shape.tensor_shape[1]  # num_output_filters
+                * m.output_shape.tensor_shape[-1]  # output_height
+                * m.output_shape.tensor_shape[-2]  # output_width
+            )
+            if m.kernel_size is not None
+            else None
+        )
         row = [
             c
             for c in [
@@ -253,6 +218,9 @@ def make_output(
                 pformat(m.output_shape.dump(), width=SHAPE_COL_WIDTH),
                 format_number(m.input_shape.size),
                 format_number(m.num_params),
+                format_number(conv2d_complexity)
+                if conv2d_complexity is not None
+                else None,
             ]
             if c is not None
         ]
@@ -357,6 +325,11 @@ def create_tree_labels(
             child_counts = [num_children[a] for a in ancestors]
             stems = "".join(vert_stem if c > 0 else " " for c in child_counts[:-1])
             br = end_branch if child_counts[-1] == 1 else branch
-            yield (s, f"{stems}{br}{leaf} ({s.module_class})")
+            class_info = (
+                s.module_class
+                if s.kernel_size is None
+                else f"{s.module_class} [{s.kernel_size}]"
+            )
+            yield (s, f"{stems}{br}{leaf} ({class_info})")
 
         num_children[parent] -= 1
