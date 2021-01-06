@@ -1,0 +1,10 @@
+* PyTorch model summaries
+
+This is based on https://github.com/sksq96/pytorch-summary, but
+modernizes and simplifies some of the code, and adds one important
+feature: it supports arbitrary inputs instead of just torch Tensors.
+
+
+** TODO:
+
+*** Integrate with [[https://github.com/Fangyh09/pytorch-receptive-field][receptive field computation]]
