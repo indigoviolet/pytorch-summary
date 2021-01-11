@@ -1,1 +1,5 @@
-from .torchsummary import summary, make_random_input, shape
+import snoop
+
+from .torchsummary import make_random_input, summary
+
+snoop.install()

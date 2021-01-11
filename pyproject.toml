@@ -6,14 +6,19 @@ authors = ["Venky Iyer <indigoviolet@gmail.com>"]
 
 [tool.poetry.dependencies]
 python = "^3.8"
-pytest = ">=5.4.3"
-torch = ">=1.5.1"
 attrs = ">=19.3.0"
 tabulate = ">=0.8.7"
 humanfriendly = ">=8.2"
 shapely = {git = "https://github.com/indigoviolet/shapely.git"}
 
 [tool.poetry.dev-dependencies]
+mypy = "^0.790"
+pytest = "^6.2.1"
+torch = "^1.7.1"
+torchvision = "^0.8.2"
+ipython = "^7.19.0"
+snoop = "^0.2.5"
+
 
 [tool.dephell.main]
 # See https://github.com/python-poetry/poetry/issues/761#issuecomment-521124268
