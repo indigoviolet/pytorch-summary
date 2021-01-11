@@ -242,8 +242,6 @@ def register_hooks(
 
     # apply() doesn't give us names
     for idx, (module_name, module) in enumerate(model.named_modules()):
-        # if isinstance(module, (torch.nn.Sequential, torch.nn.ModuleList)):
-        #     continue
 
         pre_hk = get_pre_hook(
             module,
