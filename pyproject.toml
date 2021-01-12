@@ -10,6 +10,8 @@ attrs = ">=19.3.0"
 tabulate = ">=0.8.7"
 humanfriendly = ">=8.2"
 shapely = {git = "https://github.com/indigoviolet/shapely.git"}
+jupyterlab = "^3.0.3"
+tqdm = "^4.56.0"
 
 [tool.poetry.dev-dependencies]
 mypy = "^0.790"

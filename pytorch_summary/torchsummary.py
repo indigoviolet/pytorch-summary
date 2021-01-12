@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from copy import deepcopy
 from functools import reduce
 from operator import mul
 from pprint import pformat
@@ -14,6 +15,7 @@ from typing import (
     Optional,
     Tuple,
     Union,
+    cast,
 )
 
 import attr
@@ -21,6 +23,8 @@ import tabulate
 import torch
 from humanfriendly import format_number, format_size  # type: ignore
 from shapely import Shape, shape
+from torch import Tensor, nn
+from tqdm import tqdm  # type: ignore
 
 SHAPE_COL_WIDTH = 50
 tabulate.PRESERVE_WHITESPACE = True
@@ -28,10 +32,6 @@ tabulate.PRESERVE_WHITESPACE = True
 
 def prod(x: Iterable) -> float:
     return reduce(mul, x, 1.0)
-
-
-def get_tensor_size(input: torch.Tensor, idx: int) -> torch.Size:
-    return input.size()
 
 
 def make_random_input(
@@ -51,7 +51,7 @@ def make_random_input(
 @attr.s(auto_attribs=True, eq=False)
 class ModuleInfo:
     name: str
-    module: torch.nn.Module
+    module: nn.Module
     input_shape: Shape
 
     # input_order and output_order will be different in the case of
@@ -88,7 +88,7 @@ class ModuleInfo:
             self.stride = self._assert_square(self.module, "stride")
             self.padding = self._assert_square(self.module, "padding")
 
-    def _assert_square(self, mod: torch.nn.Module, attrname: str) -> int:
+    def _assert_square(self, mod: nn.Module, attrname: str) -> int:
         attrval: Tuple[int, ...] = getattr(mod, attrname)
         if isinstance(attrval, int):
             # MaxPool2d
@@ -115,9 +115,20 @@ class ModuleInfo:
         if self.kernel_size is None:
             return self.module_class
         else:
-            return (
-                f"{self.module_class} [{self.kernel_size},{self.stride},{self.padding}]"
+            return f"{self.module_class} [{self.kernel_size},{self.stride},{self.padding}] ({self.input_order}, {self.output_order})"
+
+    def conv2d_complexity(self) -> Optional[int]:
+        assert self.output_shape is not None
+        return (
+            (
+                self.input_shape.tensor_shape[1]  # num_input_filters
+                * self.output_shape.tensor_shape[1]  # num_output_filters
+                * self.output_shape.tensor_shape[-1]  # output_height
+                * self.output_shape.tensor_shape[-2]  # output_width
             )
+            if self.kernel_size is not None
+            else None
+        )
 
 
 @attr.s(auto_attribs=True, eq=False)
@@ -126,6 +137,7 @@ class ConvInfo:
     start: float
     receptive_field: int
     conv_stage: bool = True
+    grad_receptive_field: Optional[Tuple[int]] = None
 
     @classmethod
     def for_module(cls, mod: ModuleInfo, prev: ModuleInfo):
@@ -177,9 +189,7 @@ class ModuleInfoIndex:
         return len(self.by_name)
 
 
-def get_pre_hook(
-    module, name: str, infos: ModuleInfoIndex, include_conv_info: bool
-) -> Callable:
+def get_pre_hook(module, name: str, infos: ModuleInfoIndex) -> Callable:
 
     """
     Instantiates ModuleInfo() for the module.
@@ -200,7 +210,7 @@ def get_pre_hook(
         )
 
         infos.add(msum)
-        if include_conv_info and msum.input_order > 0:
+        if msum.input_order > 0:
             msum.conv_info = ConvInfo.for_module(
                 msum, prev=infos.by_input_order[msum.input_order - 1]
             )
@@ -208,7 +218,14 @@ def get_pre_hook(
     return hook
 
 
-def get_hook(name: str, infos: ModuleInfoIndex, output_order: list) -> Callable:
+def get_fwd_hook(
+    name: str,
+    infos: ModuleInfoIndex,
+    inputs: List[Tensor],
+    output_order: List[int],
+    grad_receptive_field: bool,
+    pbar: tqdm,
+) -> Callable:
     """
     Adds output shape to the ModuleInfo() previously set up by the pre hook.
 
@@ -219,7 +236,7 @@ def get_hook(name: str, infos: ModuleInfoIndex, output_order: list) -> Callable:
     # common variable and compute their order of invocation. We cannot
     # use a variable local to get_hook() because it would get reset each
     # time -- it needs to belong to register_hooks()'s scope
-    def hook(module, input, output):
+    def hook(module, _input, output):
         msum = infos.by_name[name]
 
         if msum.output_shape is not None:
@@ -228,14 +245,56 @@ def get_hook(name: str, infos: ModuleInfoIndex, output_order: list) -> Callable:
 
         msum.output_shape = shape(output)
         msum.output_order = len(output_order)
-
         output_order.append(name)
+
+        if (
+            grad_receptive_field
+            and msum.conv_info is not None
+            and msum.conv_info.conv_stage
+        ):
+            # Note: we're only computing the receptive field wrt the first input
+            msum.conv_info.grad_receptive_field = compute_grad_receptive_field(
+                module, input=inputs[0], output=output
+            )
+
+        pbar.update()
 
     return hook
 
 
+def prepare_model_for_grad_receptive_field(model: nn.Module) -> nn.Module:
+    # make copy
+    # change initialization
+    # change maxpool to avgpool
+    # turn off batchnorm
+    # turn off dropout
+    return deepcopy(model)
+
+
+def compute_grad_receptive_field(
+    module: nn.Module, input: Tensor, output: Tensor
+) -> Tuple[int, ...]:
+    # https://github.com/rogertrullo/Receptive-Field-in-Pytorch/blob/master/Receptive_Field.ipynb
+    fake_grad = torch.zeros(output.shape)
+    # batch=0, channel=0
+    center_pos = (0, 0, *[i // 2 for i in output.shape[2:]])
+    fake_grad[center_pos] = 1
+
+    # retain_graph so we can run this multiple times
+    output.backward(gradient=fake_grad, retain_graph=True)
+
+    nonzero_idxs = input.grad.nonzero(as_tuple=True)
+    rf_dims = [(d.max() - d.min() + 1).item() for d in nonzero_idxs]
+    return tuple(rf_dims[2:])
+
+
 def register_hooks(
-    model, infos: ModuleInfoIndex, bs: int, include_conv_info: bool
+    model,
+    infos: ModuleInfoIndex,
+    bs: int,
+    inputs: List[Tensor],
+    grad_receptive_field: bool,
+    pbar: tqdm,
 ) -> List:
     hooks = []
     output_order: list = []
@@ -247,12 +306,14 @@ def register_hooks(
             module,
             name=module_name,
             infos=infos,
-            include_conv_info=include_conv_info,
         )
-        hk = get_hook(
+        hk = get_fwd_hook(
             name=module_name,
             infos=infos,
             output_order=output_order,
+            inputs=inputs,
+            grad_receptive_field=grad_receptive_field,
+            pbar=pbar,
         )
         hooks.append(module.register_forward_pre_hook(pre_hk))
         hooks.append(module.register_forward_hook(hk))
@@ -261,56 +322,65 @@ def register_hooks(
 
 
 def summary(
-    model: torch.nn.Module,
+    model: nn.Module,
     *inputs: Any,
     batch_size: int = -1,
-    get_input_size: Callable[[Any, int], torch.Size] = get_tensor_size,
-    include_input_shape: bool = False,
-    include_conv_info: bool = False,
+    extract_input_tensor: Optional[Callable[[Any], Tensor]] = None,
+    include_input_shape: bool = True,
+    include_conv_info: bool = True,
+    grad_receptive_field: bool = True,
     bytes_per_float: int = 4,
-    eval: bool = True,
-) -> Tuple[int, int]:
+):
 
     assert len(inputs) > 0, "Has inputs"
 
-    input_sizes: List[List[int]] = [
-        list(get_input_size(inp, i)) for i, inp in enumerate(inputs)
-    ]
-    assert len(input_sizes) == len(
-        inputs
-    ), f"Input sizes from get_input_sizes must match the number of inputs: {len(inputs)=} {len(input_sizes)=}"
+    input_tensors = (
+        [extract_input_tensor(i) for i in inputs]
+        if extract_input_tensor is not None
+        else [cast(Tensor, i) for i in inputs]
+    )
+    input_sizes: List[List[int]] = [list(t.shape) for t in input_tensors]
+
     assert all(
         sz[0] >= 2 for sz in input_sizes
     ), "_Each_ input must have batch_size >= 2 (for batchnorm)"
 
     module_infos = ModuleInfoIndex()
-    restore_training = model.training
-    try:
-        hooks = register_hooks(
-            model,
-            infos=module_infos,
-            bs=batch_size,
-            include_conv_info=include_conv_info,
-        )
-        if eval:
-            model.eval()
-        with torch.no_grad():
-            model(*inputs)
-    finally:
-        model.train(restore_training)
-        for h in hooks:
-            h.remove()
 
-    summary_table, total_params, trainable_params = make_output(
-        infos=module_infos,
-        batch_size=batch_size,
-        input_sizes=input_sizes,
-        include_input_shape=include_input_shape,
-        include_conv_info=include_conv_info,
-        bytes_per_float=bytes_per_float,
+    if grad_receptive_field:
+        # If we're numerically computing the Receptive Field, we will
+        # be messing with the model
+        model = prepare_model_for_grad_receptive_field(model)
+        for i in input_tensors:
+            i.requires_grad = True
+
+    with tqdm() as pbar:
+        try:
+            hooks = register_hooks(
+                model,
+                infos=module_infos,
+                bs=batch_size,
+                inputs=input_tensors,
+                grad_receptive_field=grad_receptive_field,
+                pbar=pbar,
+            )
+            pbar.reset(len(hooks) // 2)
+            model(*inputs)
+        finally:
+            for h in hooks:
+                h.remove()
+
+    print(
+        make_output(
+            infos=module_infos,
+            batch_size=batch_size,
+            input_sizes=input_sizes,
+            include_input_shape=include_input_shape,
+            include_conv_info=include_conv_info,
+            grad_receptive_field=grad_receptive_field,
+            bytes_per_float=bytes_per_float,
+        )
     )
-    print(summary_table)
-    return total_params, trainable_params
 
 
 def make_output(
@@ -319,78 +389,123 @@ def make_output(
     input_sizes: Iterable[Union[torch.Size, Iterable[int]]],
     include_input_shape: bool,
     include_conv_info: bool,
+    grad_receptive_field: bool,
     bytes_per_float: int,
-) -> Tuple[str, int, int]:
+) -> str:
 
+    layer_table = make_layer_table(
+        infos,
+        include_input_shape=include_input_shape,
+        include_conv_info=include_conv_info,
+        grad_receptive_field=grad_receptive_field,
+    )
+
+    summary_table = make_summary_table(
+        infos,
+        bytes_per_float=bytes_per_float,
+        batch_size=batch_size,
+        input_sizes=input_sizes,
+    )
+
+    return "\n".join(["", layer_table, "", summary_table])
+
+
+def nullsafe_format_number(n) -> Optional[str]:
+    return format_number(n) if n is not None else None
+
+
+ColFunc = Callable[[ModuleInfo], Any]
+
+
+def make_layer_table(
+    infos: ModuleInfoIndex,
+    include_input_shape: bool,
+    include_conv_info: bool,
+    grad_receptive_field: bool,
+) -> str:
+    layer_table: Dict[str, Optional[ColFunc]] = {
+        "Layer (type,kernel,stride,padding)": None,  # specially handled below
+        "Input Shape": (
+            (lambda m: pformat(m.input_shape, width=SHAPE_COL_WIDTH))
+            if include_input_shape
+            else None
+        ),
+        "Output Shape": lambda m: pformat(m.output_shape, width=SHAPE_COL_WIDTH),
+        "Input size": lambda m: nullsafe_format_number(m.input_shape.size),
+        "Num params": lambda m: nullsafe_format_number(m.num_params),
+        "Conv2d complexity": lambda m: nullsafe_format_number(m.conv2d_complexity()),
+        "Start": (
+            (
+                lambda m: nullsafe_format_number(m.conv_info.start)
+                if m.conv_info is not None and m.conv_info.conv_stage
+                else None
+            )
+            if include_conv_info
+            else None
+        ),
+        "Jump": (
+            (
+                lambda m: m.conv_info.jump
+                if m.conv_info is not None and m.conv_info.conv_stage
+                else None
+            )
+            if include_conv_info
+            else None
+        ),
+        "ReceptiveField": (
+            (
+                lambda m: m.conv_info.receptive_field
+                if m.conv_info is not None and m.conv_info.conv_stage
+                else None
+            )
+            if include_conv_info
+            else None
+        ),
+        "GradReceptiveField": (
+            (
+                lambda m: m.conv_info.grad_receptive_field
+                if m.conv_info is not None and m.conv_info.conv_stage
+                else None
+            )
+            if include_conv_info and grad_receptive_field
+            else None
+        ),
+    }
+
+    labeled_summaries = create_tree_labels(
+        sorted(infos.by_name.values(), key=lambda m: m.input_order)
+    )
+    rows = []
+    for m, label in labeled_summaries:
+        r = [label]
+        for _, fun in layer_table.items():
+            if fun is not None:
+                colval = fun(m)
+                r.append(colval if colval is not None else "")
+        rows.append(r)
+    return tabulate.tabulate(
+        rows,
+        headers=list(layer_table.keys()),
+        floatfmt=",.0f",
+        tablefmt="psql",
+        disable_numparse=True,
+    )
+
+
+def make_summary_table(
+    infos: ModuleInfoIndex,
+    input_sizes: Iterable[Union[torch.Size, Iterable[int]]],
+    batch_size: int,
+    bytes_per_float: int,
+) -> str:
     total_params = 0
     trainable_params = 0
-    layer_table = []
-    layer_table_header = [
-        h
-        for h in [
-            "Layer (type,kernel,stride,padding)",
-            "Input Shape" if include_input_shape else None,
-            "Output Shape",
-            "Input size",
-            "Num params",
-            "Conv2d complexity",
-            *(["Start", "Jump", "ReceptiveField"] if include_conv_info else []),
-        ]
-        if h is not None
-    ]
 
     # We use a dict to uniquify tensors among the intermediate
     # (ie. all inputs + last output) feature maps : the key is
     # id(tensor)
     intermediates: Dict[int, int] = {}
-    labeled_summaries = create_tree_labels(
-        sorted(infos.by_name.values(), key=lambda m: m.input_order)
-    )
-    for m, label in labeled_summaries:
-        assert m.output_shape is not None
-
-        conv2d_complexity = (
-            (
-                m.input_shape.tensor_shape[1]  # num_input_filters
-                * m.output_shape.tensor_shape[1]  # num_output_filters
-                * m.output_shape.tensor_shape[-1]  # output_height
-                * m.output_shape.tensor_shape[-2]  # output_width
-            )
-            if m.kernel_size is not None
-            else None
-        )
-        row = [
-            c
-            for c in [
-                label,
-                (
-                    pformat(m.input_shape, width=SHAPE_COL_WIDTH)
-                    if include_input_shape
-                    else None
-                ),
-                pformat(m.output_shape, width=SHAPE_COL_WIDTH),
-                format_number(m.input_shape.size),
-                format_number(m.num_params),
-                (
-                    format_number(conv2d_complexity)
-                    if conv2d_complexity is not None
-                    else ""
-                ),
-                *(
-                    [
-                        format_number(m.conv_info.start),
-                        m.conv_info.jump,
-                        m.conv_info.receptive_field,
-                    ]
-                    if include_conv_info
-                    and m.conv_info is not None
-                    and m.conv_info.conv_stage
-                    else []
-                ),
-            ]
-            if c is not None
-        ]
-        layer_table.append(row)
+    for m in infos.by_name.values():
         total_params += m.num_params
         if m.trainable:
             trainable_params += m.num_params
@@ -413,9 +528,12 @@ def make_output(
     total_size = total_params_size + total_intermediate_size + total_input_size
 
     summary_table = [
-        ["Total params", format_number(total_params)],
-        ["Trainable params", format_number(trainable_params)],
-        ["Non-trainable params", format_number(total_params - trainable_params)],
+        ["Total params", nullsafe_format_number(total_params)],
+        ["Trainable params", nullsafe_format_number(trainable_params)],
+        [
+            "Non-trainable params",
+            nullsafe_format_number(total_params - trainable_params),
+        ],
         ["Input size", format_size(total_input_size, binary=True)],
         [
             "Intermediates size",
@@ -428,23 +546,9 @@ def make_output(
         ],
     ]
 
-    summary_str = "\n".join(
-        [
-            tabulate.tabulate(
-                layer_table,
-                headers=layer_table_header,
-                floatfmt=",.0f",
-                tablefmt="psql",
-                disable_numparse=True,
-            ),
-            "",
-            tabulate.tabulate(
-                summary_table, floatfmt=",.1f", tablefmt="psql", disable_numparse=True
-            ),
-        ]
+    return tabulate.tabulate(
+        summary_table, floatfmt=",.1f", tablefmt="psql", disable_numparse=True
     )
-
-    return summary_str, total_params, trainable_params
 
 
 def parse_tree(
