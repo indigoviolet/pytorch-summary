@@ -15,6 +15,7 @@ from typing import (
     List,
     Optional,
     Tuple,
+    Type,
     Union,
     cast,
 )
@@ -29,6 +30,20 @@ from tqdm import tqdm  # type: ignore
 
 SHAPE_COL_WIDTH = 50
 tabulate.PRESERVE_WHITESPACE = True
+
+
+def mod_isinstance(
+    obj: Any, types: Union[Type[nn.Module], Tuple[Type[nn.Module], ...]]
+) -> bool:
+    """Similar to isinstance(obj, (...)); but it only checks that name of
+    the obj ends with the module's name.
+
+    For ex. mod_isinstance(FixedBatchNorm2d(), nn.BatchNorm2d) == True
+    """
+    if not isinstance(types, tuple):
+        types = (types,)
+
+    return any(obj.__class__.__name__.endswith(c.__name__) for c in types)
 
 
 def prod(x: Iterable) -> float:
@@ -84,7 +99,7 @@ class ModuleInfo:
         if hasattr(self.module, "bias") and hasattr(self.module.bias, "size"):
             self.num_params += prod(self.module.bias.size())
 
-        if isinstance(self.module, (nn.Conv2d, nn.MaxPool2d, nn.AvgPool2d)):
+        if mod_isinstance(self.module, (nn.Conv2d, nn.MaxPool2d, nn.AvgPool2d)):
             self.kernel_size = self._assert_square(self.module, "kernel_size")
             self.stride = self._assert_square(self.module, "stride")
             self.padding = self._assert_square(self.module, "padding")
@@ -149,7 +164,7 @@ class ConvInfo:
             prev_conv_info is not None
         ), f"{prev} has no conv_info, while computing {mod}"
 
-        if isinstance(mod.module, (nn.Conv2d, nn.MaxPool2d, nn.AvgPool2d)):
+        if mod_isinstance(mod.module, (nn.Conv2d, nn.MaxPool2d, nn.AvgPool2d)):
             assert (
                 mod.kernel_size is not None
                 and mod.stride is not None
@@ -168,7 +183,7 @@ class ConvInfo:
                     + ((mod.kernel_size - 1) / 2 - mod.padding) * prev_conv_info.jump
                 ),
             )
-        elif isinstance(mod.module, nn.ConvTranspose2d):
+        elif mod_isinstance(mod.module, nn.ConvTranspose2d):
             return ConvInfo(jump=0, receptive_field=0, start=0, conv_stage=False)
         else:
             return ConvInfo(
@@ -266,11 +281,11 @@ def get_fwd_hook(
     return hook
 
 
-def init_for_grad_receptive_field(m: Union[nn.Conv2d, nn.BatchNorm2d]):
+def init_for_grad_receptive_field(m: nn.Module):
     assert m.weight is not None
-    nn.init.constant_(m.weight, val=1.0)
+    nn.init.constant_(cast(Tensor, m.weight), val=1.0)
     if m.bias is not None:
-        nn.init.constant_(m.bias, val=0.0)
+        nn.init.constant_(cast(Tensor, m.bias), val=0.0)
 
 
 def prepare_model_for_grad_receptive_field(model: nn.Module) -> nn.Module:
@@ -285,25 +300,26 @@ def prepare_model_for_grad_receptive_field(model: nn.Module) -> nn.Module:
 
 def modify_for_grad_receptive_field(module: nn.Module):
     for name, m in module.named_children():
-        if isinstance(m, nn.Conv2d):
+        if mod_isinstance(m, nn.Conv2d):
             init_for_grad_receptive_field(m)
-        elif isinstance(m, nn.MaxPool2d):
+        elif mod_isinstance(m, nn.MaxPool2d):
             # change maxpool to avgpool
             replacement = nn.AvgPool2d(
-                kernel_size=m.kernel_size,
-                stride=m.stride,
-                padding=m.padding,
-                ceil_mode=m.ceil_mode,
+                kernel_size=cast(int, m.kernel_size),
+                stride=cast(int, m.stride),
+                padding=cast(int, m.padding),
+                ceil_mode=cast(bool, m.ceil_mode),
             )
             module.add_module(name, replacement)
-        elif isinstance(m, nn.Dropout):
-            # turn off dropout
-            m.p = 0.0
-        elif isinstance(m, nn.BatchNorm2d):
+        elif mod_isinstance(m, nn.Dropout):
+            # turn off Dropout
+            # https://discuss.pytorch.org/t/how-to-freeze-bn-layers-while-training-the-rest-of-network-mean-and-var-wont-freeze/89736/10
+            m.eval()
+        elif mod_isinstance(m, nn.BatchNorm2d):
             # turn off batchnorm
             # https://discuss.pytorch.org/t/how-to-close-batchnorm-when-using-torchvision-models/21812/2
             if hasattr(m, "reset_parameters"):
-                m.reset_parameters()
+                cast(Callable, m.reset_parameters)()
             m.eval()
             init_for_grad_receptive_field(m)
 

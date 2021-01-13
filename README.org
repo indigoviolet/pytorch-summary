@@ -78,7 +78,10 @@ Improvements:
      + initialization of Conv2d
      + replaces MaxPool2d with AvgPool2d
      + turns off Dropout and BatchNorm2d
-    - Requires a tensor output from a layer to compute RF for that layer
+  - Treats any class ending in ~Conv2d~ as a ~Conv2d~, and similarly
+    for ~BatchNorm2d~, ~MaxPool2d~, ~Dropout~. This is for handling
+    custom module classes that don't directly derive from the nn. classes
+  - Requires a tensor output from a layer to compute RF for that layer
 
 * Conv2d complexity
 
