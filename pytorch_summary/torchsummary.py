@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from contextlib import contextmanager
 from copy import deepcopy
 from functools import reduce
 from operator import mul
@@ -83,7 +84,7 @@ class ModuleInfo:
         if hasattr(self.module, "bias") and hasattr(self.module.bias, "size"):
             self.num_params += prod(self.module.bias.size())
 
-        if isinstance(self.module, (torch.nn.Conv2d, torch.nn.MaxPool2d)):
+        if isinstance(self.module, (nn.Conv2d, nn.MaxPool2d, nn.AvgPool2d)):
             self.kernel_size = self._assert_square(self.module, "kernel_size")
             self.stride = self._assert_square(self.module, "stride")
             self.padding = self._assert_square(self.module, "padding")
@@ -115,7 +116,9 @@ class ModuleInfo:
         if self.kernel_size is None:
             return self.module_class
         else:
-            return f"{self.module_class} [{self.kernel_size},{self.stride},{self.padding}] ({self.input_order}, {self.output_order})"
+            return (
+                f"{self.module_class} [{self.kernel_size},{self.stride},{self.padding}]"
+            )
 
     def conv2d_complexity(self) -> Optional[int]:
         assert self.output_shape is not None
@@ -146,7 +149,7 @@ class ConvInfo:
             prev_conv_info is not None
         ), f"{prev} has no conv_info, while computing {mod}"
 
-        if isinstance(mod.module, (torch.nn.Conv2d, torch.nn.MaxPool2d)):
+        if isinstance(mod.module, (nn.Conv2d, nn.MaxPool2d, nn.AvgPool2d)):
             assert (
                 mod.kernel_size is not None
                 and mod.stride is not None
@@ -165,7 +168,7 @@ class ConvInfo:
                     + ((mod.kernel_size - 1) / 2 - mod.padding) * prev_conv_info.jump
                 ),
             )
-        elif isinstance(mod.module, torch.nn.ConvTranspose2d):
+        elif isinstance(mod.module, nn.ConvTranspose2d):
             return ConvInfo(jump=0, receptive_field=0, start=0, conv_stage=False)
         else:
             return ConvInfo(
@@ -224,7 +227,7 @@ def get_fwd_hook(
     inputs: List[Tensor],
     output_order: List[int],
     grad_receptive_field: bool,
-    pbar: tqdm,
+    pbar: Optional[tqdm] = None,
 ) -> Callable:
     """
     Adds output shape to the ModuleInfo() previously set up by the pre hook.
@@ -254,71 +257,154 @@ def get_fwd_hook(
         ):
             # Note: we're only computing the receptive field wrt the first input
             msum.conv_info.grad_receptive_field = compute_grad_receptive_field(
-                module, input=inputs[0], output=output
+                msum, input=inputs[0], output=output, infos=infos
             )
 
-        pbar.update()
+        if pbar:
+            pbar.update()
 
     return hook
 
 
+def getattr_mod(module: nn.Module, attr: Union[str, int]) -> nn.Module:
+    if isinstance(attr, int):
+        assert isinstance(module, (nn.Sequential, nn.ModuleList))
+        return module[attr]
+    else:
+        return getattr(module, attr)
+
+
+def setattr_mod(module: nn.Module, attr: Union[str, int], val: nn.Module):
+    if isinstance(attr, int):
+        assert isinstance(module, (nn.Sequential, nn.ModuleList))
+        module[attr] = val
+    else:
+        setattr(module, attr, val)
+
+
+def replace_module(model: nn.Module, name: str, replacement: nn.Module):
+    parts = name.split(".")
+    leading, trailing = parts[:-1], parts[-1]
+    replace_on = model
+    for p in leading:
+        replace_on = getattr_mod(replace_on, p)
+
+    setattr_mod(replace_on, trailing, replacement)
+
+
+def init_for_grad_receptive_field(m: Union[nn.Conv2d, nn.BatchNorm2d]):
+    assert m.weight is not None
+    nn.init.constant_(m.weight, val=1.0)
+    if m.bias is not None:
+        nn.init.constant_(m.bias, val=0.0)
+
+
 def prepare_model_for_grad_receptive_field(model: nn.Module) -> nn.Module:
+    # See:
+    # https://github.com/rogertrullo/Receptive-Field-in-Pytorch/blob/master/Receptive_Field.ipynb
+
     # make copy
-    # change initialization
-    # change maxpool to avgpool
-    # turn off batchnorm
-    # turn off dropout
-    return deepcopy(model)
+    model = deepcopy(model)
+
+    for mname, m in model.named_modules():
+        if isinstance(m, nn.Conv2d):
+            init_for_grad_receptive_field(m)
+        elif isinstance(m, nn.MaxPool2d):
+            # change maxpool to avgpool
+            replacement = nn.AvgPool2d(
+                kernel_size=m.kernel_size,
+                stride=m.stride,
+                padding=m.padding,
+                ceil_mode=m.ceil_mode,
+            )
+            replace_module(model, mname, replacement)
+        elif isinstance(m, nn.Dropout):
+            # turn off dropout
+            m.p = 0.0
+        elif isinstance(m, nn.BatchNorm2d):
+            # turn off batchnorm
+            # https://discuss.pytorch.org/t/how-to-close-batchnorm-when-using-torchvision-models/21812/2
+            init_for_grad_receptive_field(m)
+            m.reset_parameters()
+            m.eval()
+
+    return model
 
 
 def compute_grad_receptive_field(
-    module: nn.Module, input: Tensor, output: Tensor
+    mod: ModuleInfo, input: Tensor, output: Tensor, infos: ModuleInfoIndex
 ) -> Tuple[int, ...]:
+
+    if not isinstance(output, Tensor):
+        # We cannot backward() from this. Skip, we just won't be able
+        # to compute the receptive field here without some other
+        # affordance to combine the tensors in this output into a
+        # "loss"
+        return (-1,)
+
     # https://github.com/rogertrullo/Receptive-Field-in-Pytorch/blob/master/Receptive_Field.ipynb
     fake_grad = torch.zeros(output.shape)
     # batch=0, channel=0
     center_pos = (0, 0, *[i // 2 for i in output.shape[2:]])
     fake_grad[center_pos] = 1
 
-    # retain_graph so we can run this multiple times
+    # zero_grad everything before and including this module, since backward() accumulates
+    for i in range(0, mod.input_order + 1):
+        infos.by_input_order[i].module.zero_grad()
+
+    # retain_graph so we can run this multiple times and not drop the
+    # intermediate results from forward()
     output.backward(gradient=fake_grad, retain_graph=True)
 
-    nonzero_idxs = input.grad.nonzero(as_tuple=True)
+    # Find the extent of pixels affected; drop batch/channel
+    nonzero_idxs = input.grad.nonzero(as_tuple=True)[2:]
     rf_dims = [(d.max() - d.min() + 1).item() for d in nonzero_idxs]
-    return tuple(rf_dims[2:])
+    return tuple(rf_dims)
 
 
+@contextmanager
 def register_hooks(
     model,
     infos: ModuleInfoIndex,
     bs: int,
     inputs: List[Tensor],
     grad_receptive_field: bool,
-    pbar: tqdm,
-) -> List:
+    use_pbar: bool,
+):
     hooks = []
     output_order: list = []
+    progbar = tqdm() if use_pbar else None
 
-    # apply() doesn't give us names
-    for idx, (module_name, module) in enumerate(model.named_modules()):
+    try:
+        # apply() doesn't give us names
+        for idx, (module_name, module) in enumerate(model.named_modules()):
 
-        pre_hk = get_pre_hook(
-            module,
-            name=module_name,
-            infos=infos,
-        )
-        hk = get_fwd_hook(
-            name=module_name,
-            infos=infos,
-            output_order=output_order,
-            inputs=inputs,
-            grad_receptive_field=grad_receptive_field,
-            pbar=pbar,
-        )
-        hooks.append(module.register_forward_pre_hook(pre_hk))
-        hooks.append(module.register_forward_hook(hk))
+            pre_hk = get_pre_hook(
+                module,
+                name=module_name,
+                infos=infos,
+            )
+            hk = get_fwd_hook(
+                name=module_name,
+                infos=infos,
+                output_order=output_order,
+                inputs=inputs,
+                grad_receptive_field=grad_receptive_field,
+                pbar=progbar,
+            )
+            hooks.append(module.register_forward_pre_hook(pre_hk))
+            hooks.append(module.register_forward_hook(hk))
 
-    return hooks
+        if progbar is not None:
+            progbar.reset(len(hooks) // 2)
+
+        yield
+    finally:
+        for h in hooks:
+            h.remove()
+
+        if progbar is not None:
+            progbar.close()
 
 
 def summary(
@@ -330,6 +416,7 @@ def summary(
     include_conv_info: bool = True,
     grad_receptive_field: bool = True,
     bytes_per_float: int = 4,
+    use_pbar: bool = True,
 ):
 
     assert len(inputs) > 0, "Has inputs"
@@ -354,21 +441,15 @@ def summary(
         for i in input_tensors:
             i.requires_grad = True
 
-    with tqdm() as pbar:
-        try:
-            hooks = register_hooks(
-                model,
-                infos=module_infos,
-                bs=batch_size,
-                inputs=input_tensors,
-                grad_receptive_field=grad_receptive_field,
-                pbar=pbar,
-            )
-            pbar.reset(len(hooks) // 2)
-            model(*inputs)
-        finally:
-            for h in hooks:
-                h.remove()
+    with register_hooks(
+        model,
+        infos=module_infos,
+        bs=batch_size,
+        inputs=input_tensors,
+        grad_receptive_field=grad_receptive_field,
+        use_pbar=use_pbar,
+    ):
+        model(*inputs)
 
     print(
         make_output(
@@ -393,7 +474,7 @@ def make_output(
     bytes_per_float: int,
 ) -> str:
 
-    layer_table = make_layer_table(
+    layer_table_cols = make_layer_table(
         infos,
         include_input_shape=include_input_shape,
         include_conv_info=include_conv_info,
@@ -407,7 +488,16 @@ def make_output(
         input_sizes=input_sizes,
     )
 
-    return "\n".join(["", layer_table, "", summary_table])
+    note = (
+        [
+            "",
+            "** Note: grad_receptive_field=True, Model modified: Conv2d init, MaxPool2d->AvgPool2d, Dropout/Batchnorm off",
+        ]
+        if grad_receptive_field
+        else []
+    )
+
+    return "\n".join(["", layer_table_cols, "", summary_table] + note)
 
 
 def nullsafe_format_number(n) -> Optional[str]:
@@ -423,8 +513,7 @@ def make_layer_table(
     include_conv_info: bool,
     grad_receptive_field: bool,
 ) -> str:
-    layer_table: Dict[str, Optional[ColFunc]] = {
-        "Layer (type,kernel,stride,padding)": None,  # specially handled below
+    layer_table_cols: Dict[str, Optional[ColFunc]] = {
         "Input Shape": (
             (lambda m: pformat(m.input_shape, width=SHAPE_COL_WIDTH))
             if include_input_shape
@@ -467,7 +556,7 @@ def make_layer_table(
                 if m.conv_info is not None and m.conv_info.conv_stage
                 else None
             )
-            if include_conv_info and grad_receptive_field
+            if grad_receptive_field
             else None
         ),
     }
@@ -478,14 +567,16 @@ def make_layer_table(
     rows = []
     for m, label in labeled_summaries:
         r = [label]
-        for _, fun in layer_table.items():
+        for _, fun in layer_table_cols.items():
             if fun is not None:
                 colval = fun(m)
                 r.append(colval if colval is not None else "")
         rows.append(r)
+
     return tabulate.tabulate(
         rows,
-        headers=list(layer_table.keys()),
+        headers=["Layer (type,kernel,stride,padding)"]
+        + [k for k, v in layer_table_cols.items() if v is not None],
         floatfmt=",.0f",
         tablefmt="psql",
         disable_numparse=True,
