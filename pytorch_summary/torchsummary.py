@@ -266,32 +266,6 @@ def get_fwd_hook(
     return hook
 
 
-def getattr_mod(module: nn.Module, attr: Union[str, int]) -> nn.Module:
-    if isinstance(attr, int):
-        assert isinstance(module, (nn.Sequential, nn.ModuleList))
-        return module[attr]
-    else:
-        return getattr(module, attr)
-
-
-def setattr_mod(module: nn.Module, attr: Union[str, int], val: nn.Module):
-    if isinstance(attr, int):
-        assert isinstance(module, (nn.Sequential, nn.ModuleList))
-        module[attr] = val
-    else:
-        setattr(module, attr, val)
-
-
-def replace_module(model: nn.Module, name: str, replacement: nn.Module):
-    parts = name.split(".")
-    leading, trailing = parts[:-1], parts[-1]
-    replace_on = model
-    for p in leading:
-        replace_on = getattr_mod(replace_on, p)
-
-    setattr_mod(replace_on, trailing, replacement)
-
-
 def init_for_grad_receptive_field(m: Union[nn.Conv2d, nn.BatchNorm2d]):
     assert m.weight is not None
     nn.init.constant_(m.weight, val=1.0)
@@ -305,8 +279,12 @@ def prepare_model_for_grad_receptive_field(model: nn.Module) -> nn.Module:
 
     # make copy
     model = deepcopy(model)
+    model.apply(modify_for_grad_receptive_field)
+    return model
 
-    for mname, m in model.named_modules():
+
+def modify_for_grad_receptive_field(module: nn.Module):
+    for name, m in module.named_children():
         if isinstance(m, nn.Conv2d):
             init_for_grad_receptive_field(m)
         elif isinstance(m, nn.MaxPool2d):
@@ -317,18 +295,17 @@ def prepare_model_for_grad_receptive_field(model: nn.Module) -> nn.Module:
                 padding=m.padding,
                 ceil_mode=m.ceil_mode,
             )
-            replace_module(model, mname, replacement)
+            module.add_module(name, replacement)
         elif isinstance(m, nn.Dropout):
             # turn off dropout
             m.p = 0.0
         elif isinstance(m, nn.BatchNorm2d):
             # turn off batchnorm
             # https://discuss.pytorch.org/t/how-to-close-batchnorm-when-using-torchvision-models/21812/2
-            init_for_grad_receptive_field(m)
-            m.reset_parameters()
+            if hasattr(m, "reset_parameters"):
+                m.reset_parameters()
             m.eval()
-
-    return model
+            init_for_grad_receptive_field(m)
 
 
 def compute_grad_receptive_field(
