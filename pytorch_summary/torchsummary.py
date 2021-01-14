@@ -77,7 +77,7 @@ class ModuleInfo:
     input_order: int
 
     output_shape: Optional[Shape] = None
-    output_order: int = -1
+    output_order: Optional[int] = None
 
     module_class: str = attr.ib(init=False)
     num_params: int = attr.ib(init=False, default=0)
@@ -87,7 +87,9 @@ class ModuleInfo:
     padding: Optional[int] = attr.ib(init=False, default=None)
     stride: Optional[int] = attr.ib(init=False, default=None)
 
-    _conv_info: Optional[ConvInfo] = attr.ib(init=False, default=None)
+    conv_info: ConvInfo = attr.ib(
+        init=False, factory=lambda: ConvInfo(start=0.5, jump=1, receptive_field=1)
+    )
 
     def __attrs_post_init__(self):
         self.module_class = self.module.__class__.__name__
@@ -114,19 +116,6 @@ class ModuleInfo:
         ) == 2, f"{attrname} for {self.name} must be square, found {attrval}"
         return attrval[0]
 
-    @property
-    def conv_info(self) -> Optional[ConvInfo]:
-        if self._conv_info is not None:
-            return self._conv_info
-        elif self.input_order == 0:
-            return ConvInfo(start=0.5, jump=1, receptive_field=1)
-        else:
-            return None
-
-    @conv_info.setter
-    def conv_info(self, val: ConvInfo):
-        self._conv_info = val
-
     def module_info(self) -> str:
         if self.kernel_size is None:
             return self.module_class
@@ -134,6 +123,9 @@ class ModuleInfo:
             return (
                 f"{self.module_class} [{self.kernel_size},{self.stride},{self.padding}]"
             )
+
+    def has_children(self) -> bool:
+        return len(list(self.module.children())) > 0
 
     def conv2d_complexity(self) -> Optional[int]:
         assert self.output_shape is not None
@@ -155,7 +147,7 @@ class ConvInfo:
     start: float
     receptive_field: int
     conv_stage: bool = True
-    grad_receptive_field: Optional[Tuple[int]] = None
+    grad_receptive_field: Tuple[int, ...] = (-1,)
 
     @classmethod
     def for_module(cls, mod: ModuleInfo, prev: ModuleInfo):
@@ -198,10 +190,13 @@ class ConvInfo:
 class ModuleInfoIndex:
     by_name: Dict[str, ModuleInfo] = attr.ib(factory=dict)
     by_input_order: Dict[int, ModuleInfo] = attr.ib(factory=dict)
+    by_output_order: Dict[int, ModuleInfo] = attr.ib(factory=dict)
 
-    def add(self, module_info: ModuleInfo):
+    def update(self, module_info: ModuleInfo):
         self.by_name[module_info.name] = module_info
         self.by_input_order[module_info.input_order] = module_info
+        if module_info.output_order is not None:
+            self.by_output_order[module_info.output_order] = module_info
 
     def __len__(self):
         return len(self.by_name)
@@ -215,7 +210,7 @@ def get_pre_hook(module, name: str, infos: ModuleInfoIndex) -> Callable:
     Executes before forward()
     """
 
-    def hook(module, input):
+    def hook(module: nn.Module, input):
         if name in infos.by_name:
             return
 
@@ -226,12 +221,11 @@ def get_pre_hook(module, name: str, infos: ModuleInfoIndex) -> Callable:
             # Input is a tuple of size 1, always?
             input_shape=shape(*input),
         )
-
-        infos.add(msum)
         if msum.input_order > 0:
             msum.conv_info = ConvInfo.for_module(
                 msum, prev=infos.by_input_order[msum.input_order - 1]
             )
+        infos.update(msum)
 
     return hook
 
@@ -240,7 +234,7 @@ def get_fwd_hook(
     name: str,
     infos: ModuleInfoIndex,
     inputs: List[Tensor],
-    output_order: List[int],
+    output_order: List[str],
     grad_receptive_field: bool,
     pbar: Optional[tqdm] = None,
 ) -> Callable:
@@ -254,7 +248,7 @@ def get_fwd_hook(
     # common variable and compute their order of invocation. We cannot
     # use a variable local to get_hook() because it would get reset each
     # time -- it needs to belong to register_hooks()'s scope
-    def hook(module, _input, output):
+    def hook(module: nn.Module, _input, output):
         msum = infos.by_name[name]
 
         if msum.output_shape is not None:
@@ -264,16 +258,19 @@ def get_fwd_hook(
         msum.output_shape = shape(output)
         msum.output_order = len(output_order)
         output_order.append(name)
+        infos.update(msum)
 
-        if (
-            grad_receptive_field
-            and msum.conv_info is not None
-            and msum.conv_info.conv_stage
-        ):
-            # Note: we're only computing the receptive field wrt the first input
-            msum.conv_info.grad_receptive_field = compute_grad_receptive_field(
-                msum, input=inputs[0], output=output, infos=infos
-            )
+        if grad_receptive_field:
+            if msum.conv_info.conv_stage:
+                # Note: we're only computing the receptive field wrt the first input
+                msum.conv_info.grad_receptive_field = compute_grad_receptive_field(
+                    msum, input=inputs[0], output=output, infos=infos
+                )
+            else:
+                prev = infos.by_output_order[msum.output_order - 1]
+                msum.conv_info.grad_receptive_field = (
+                    prev.conv_info.grad_receptive_field
+                )
 
         if pbar:
             pbar.update()
@@ -514,7 +511,9 @@ def make_layer_table(
         ),
         "Output Shape": lambda m: pformat(m.output_shape, width=SHAPE_COL_WIDTH),
         "Input size": lambda m: nullsafe_format_number(m.input_shape.size),
-        "Num params": lambda m: nullsafe_format_number(m.num_params),
+        "Num params": (
+            lambda m: nullsafe_format_number(m.num_params) if m.num_params > 0 else None
+        ),
         "Conv2d complexity": lambda m: nullsafe_format_number(m.conv2d_complexity()),
         "Start": (
             (
@@ -537,7 +536,8 @@ def make_layer_table(
         "ReceptiveField": (
             (
                 lambda m: m.conv_info.receptive_field
-                if m.conv_info is not None and m.conv_info.conv_stage
+                if m.conv_info is not None
+                and (m.conv_info.conv_stage or m.has_children())
                 else None
             )
             if include_conv_info
@@ -546,7 +546,8 @@ def make_layer_table(
         "GradReceptiveField": (
             (
                 lambda m: m.conv_info.grad_receptive_field
-                if m.conv_info is not None and m.conv_info.conv_stage
+                if m.conv_info is not None
+                and (m.conv_info.conv_stage or m.has_children())
                 else None
             )
             if grad_receptive_field
@@ -599,7 +600,7 @@ def make_summary_table(
         intermediates.update(m.input_shape.tensor_sizes)
 
     # Capture only the last output separately
-    last_module = max(infos.by_name.values(), key=lambda m: m.output_order)
+    last_module = max(infos.by_name.values(), key=lambda m: m.output_order or -1)
     assert last_module.output_shape is not None
     intermediates.update(last_module.output_shape.tensor_sizes)
 
