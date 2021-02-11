@@ -9,8 +9,8 @@ python = "^3.8"
 attrs = ">=19.3.0"
 tabulate = ">=0.8.7"
 humanfriendly = ">=8.2"
-shapely = {git = "https://github.com/indigoviolet/shapely.git"}
-jupyterlab = "^3.0.3"
+# shapely = {path = "../shapely", develop = true}
+shapely = { git = "https://github.com/indigoviolet/shapely" }
 tqdm = "^4.56.0"
 
 [tool.poetry.dev-dependencies]
@@ -20,6 +20,7 @@ torch = "^1.7.1"
 torchvision = "^0.8.2"
 ipython = "^7.19.0"
 snoop = "^0.2.5"
+jupyterlab = "^3.0.3"
 
 
 [tool.dephell.main]
